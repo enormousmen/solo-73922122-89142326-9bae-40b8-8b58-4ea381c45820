@@ -31,6 +31,7 @@ from typing import Any
 
 from . import media
 from .config import Settings
+from .stderr_capture import BoundedStderrCollector
 
 TERMINAL_ATTEMPT_STATUSES = frozenset(
     {"succeeded", "failed", "cancelled", "superseded", "skipped"}
@@ -107,12 +108,11 @@ class Attempt:
     terminate_sent_at: float | None = None
     exit_code: int | None = None
     artifact_path: Path | None = None
-    log_path: Path | None = None
     error: str | None = None
     cancel_reason: str | None = None
     slot_held: bool = False
     proc: Any = field(default=None, repr=False)
-    log_file: Any = field(default=None, repr=False)
+    stderr_collector: BoundedStderrCollector | None = field(default=None, repr=False)
 
     def elapsed_ms(self, now: float | None = None) -> int | None:
         if self.started_at is None:
@@ -350,6 +350,14 @@ class BatchManager:
                 for attempt in batch.attempts():
                     if attempt.proc is not None and attempt.proc.poll() is None:
                         media.kill_process(attempt.proc)
+        # Best-effort: let the daemon drain threads finish their final read so
+        # no thread is left mid-read while the interpreter winds down.
+        for batch in self._batches.values():
+            for attempt in batch.attempts():
+                if attempt.stderr_collector is not None:
+                    attempt.stderr_collector.finish(
+                        timeout=self.settings.stderr_drain_timeout_seconds
+                    )
 
     # ---------------------------------------------------------------- internals
 
@@ -416,25 +424,21 @@ class BatchManager:
         batch = self._batch_for(segment)
         source = self.settings.input_dir / self._fixture_name(segment)
         attempt.artifact_path = batch.work_dir / f"{segment.name}_{attempt.id}.mp4"
-        attempt.log_path = batch.work_dir / f"{segment.name}_{attempt.id}.log"
         cmd = media.transcode_command(
             self.settings, source, attempt.artifact_path, slow=slow
         )
         attempt.started_at = time.time()
         segment.status = "running" if segment.selected_attempt_id is None else segment.status
         try:
-            log_file = open(attempt.log_path, "wb")
-            attempt.log_file = log_file
-            attempt.proc = subprocess.Popen(
+            # stderr goes to a pipe drained by a bounded collector: the child
+            # can never block on a full pipe, and only its last 4 KiB survive.
+            proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=log_file,
+                stderr=subprocess.PIPE,
                 close_fds=True,
             )
-            attempt.status = "running"
-            attempt.slot_held = True
-            self._slots_used += 1
         except OSError as exc:
             attempt.status = "failed"
             attempt.finished_at = time.time()
@@ -442,11 +446,33 @@ class BatchManager:
             attempt.exit_code = None
             attempt.proc = None
             attempt.slot_held = False
-            if attempt.log_file is not None:
-                attempt.log_file.close()
-                attempt.log_file = None
             self._refresh_segment(segment)
             self._evaluate_batch(batch, attempt.finished_at)
+            return
+        try:
+            attempt.stderr_collector = BoundedStderrCollector(
+                proc, self.settings.stderr_tail_bytes
+            )
+            attempt.stderr_collector.start()
+        except Exception:
+            # Extremely unlikely (thread creation failure): do not leak the
+            # child or its pipe; treat the attempt as failed to start.
+            media.kill_process(proc)
+            if proc.stderr is not None:
+                proc.stderr.close()
+            attempt.status = "failed"
+            attempt.finished_at = time.time()
+            attempt.error = "无法启动 ffmpeg 日志采集"
+            attempt.exit_code = None
+            attempt.proc = None
+            attempt.slot_held = False
+            self._refresh_segment(segment)
+            self._evaluate_batch(batch, attempt.finished_at)
+            return
+        attempt.proc = proc
+        attempt.status = "running"
+        attempt.slot_held = True
+        self._slots_used += 1
 
     def _fixture_name(self, segment: Segment) -> str:
         return f"clip_{segment.index + 1}_{segment.name}.mp4"
@@ -508,9 +534,8 @@ class BatchManager:
         attempt.exit_code = returncode
         attempt.finished_at = now
         attempt.proc = None
-        if attempt.log_file is not None:
-            attempt.log_file.close()
-            attempt.log_file = None
+        # The process has exited: the slot is returned immediately, even while
+        # the stderr drain thread may still be flushing the final pipe bytes.
         if attempt.slot_held:
             attempt.slot_held = False
             self._slots_used = max(0, self._slots_used - 1)
@@ -533,22 +558,32 @@ class BatchManager:
             elif cancellable_done:
                 attempt.status = "cancelled"
             else:
+                # Wait for the drain thread so the failure detail includes the
+                # tail ffmpeg wrote immediately before exiting.
+                self._await_stderr(attempt)
                 attempt.status = "failed"
                 attempt.error = self._failure_detail(attempt, returncode)
             if attempt.artifact_path is not None:
                 attempt.artifact_path.unlink(missing_ok=True)
         elif batch.status == "failed":
-            attempt.status = "cancelled" if cancellable_done else "failed"
-            if not cancellable_done:
+            if cancellable_done:
+                attempt.status = "cancelled"
+            else:
+                self._await_stderr(attempt)
+                attempt.status = "failed"
                 attempt.error = self._failure_detail(attempt, returncode)
             if attempt.artifact_path is not None:
                 attempt.artifact_path.unlink(missing_ok=True)
         elif artifact_ok:
+            # Selection is decided purely by process exit + artifact validity:
+            # it never waits on stderr drainage, so a first attempt whose logs
+            # arrive late still wins on first valid artifact.
             attempt.status = "succeeded"
             segment.selected_attempt_id = attempt.id
             segment.status = "succeeded"
             self._cancel_segment_siblings(batch, segment, keep=attempt)
         else:
+            self._await_stderr(attempt)
             attempt.status = "failed"
             attempt.error = self._failure_detail(attempt, returncode)
             attempt.artifact_path.unlink(missing_ok=True)
@@ -556,24 +591,31 @@ class BatchManager:
         self._refresh_segment(segment)
         self._evaluate_batch(batch, now)
 
+    def _await_stderr(self, attempt: Attempt) -> None:
+        """Block briefly until the attempt's stderr tail is fully collected."""
+
+        collector = attempt.stderr_collector
+        if collector is None:
+            return
+        # The process has already exited and closed its end of the pipe, so
+        # the remaining drain is only the buffered tail and finishes quickly.
+        collector.finish(timeout=self.settings.stderr_drain_timeout_seconds)
+
     def _failure_detail(self, attempt: Attempt, returncode: int) -> str:
         if returncode != 0:
             base = f"ffmpeg 退出码 {returncode}"
         else:
             base = "ffmpeg 成功退出但没有可用的产物"
-        tail = self._read_log_tail(attempt.log_path)
-        return f"{base}: {tail}" if tail else base
-
-    @staticmethod
-    def _read_log_tail(path: Path | None, limit: int = 500) -> str:
-        if path is None or not path.is_file():
-            return ""
-        try:
-            data = path.read_bytes()[-4096:]
-        except OSError:
-            return ""
-        text = data.decode("utf-8", "replace").strip()
-        return text[-limit:]
+        collector = attempt.stderr_collector
+        if collector is None:
+            return base
+        tail, truncated = collector.tail_text()
+        if not tail:
+            return base
+        if truncated:
+            note = f"（日志已截断，仅保留末尾 {self.settings.stderr_tail_bytes} 字节）"
+            return f"{base}: {note}\n{tail}"
+        return f"{base}:\n{tail}"
 
     def _cancel_segment_siblings(
         self, batch: Batch, segment: Segment, *, keep: Attempt

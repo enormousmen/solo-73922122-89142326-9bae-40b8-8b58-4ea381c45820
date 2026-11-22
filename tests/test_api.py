@@ -114,3 +114,51 @@ def test_failed_batch_has_no_download(client):
     assert final["download_ready"] is False
     response = client.get(f"/batches/{created['id']}/download")
     assert response.status_code == 409
+
+
+def test_api_stays_responsive_and_exposes_truncated_stderr_tail(client):
+    # Multi-megabyte stderr on every transcode: without continuous pipe
+    # draining the ffmpeg processes would block and this test would time out.
+    FAKE_CONFIG.write_text(
+        json.dumps(
+            {
+                "sleep": 0.1,
+                "stderr_bytes": 2 * 1024 * 1024,
+                "segments": {"B": {"normal": {"sleep": 0.1, "exit": 9}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    created = client.post("/api/batches", json={"slow_clip": "A"}).json()
+
+    # Poll the same endpoints the web page uses while noise is being produced.
+    deadline = time.monotonic() + 20
+    saw_running = False
+    final = None
+    while time.monotonic() < deadline:
+        health = client.get("/healthz")
+        assert health.status_code == 200
+        listing = client.get("/api/batches")
+        assert listing.status_code == 200
+        body = client.get(f"/api/batches/{created['id']}")
+        assert body.status_code == 200
+        if body.json()["status"] == "running":
+            saw_running = True
+        if body.json()["status"] in ("ready", "failed"):
+            final = body.json()
+            break
+        time.sleep(0.03)
+    assert final is not None
+    assert saw_running is True
+    assert final["status"] == "failed"
+    failed = next(
+        a
+        for s in final["segments"]
+        if s["name"] == "B"
+        for a in s["attempts"]
+    )
+    assert failed["exit_code"] == 9
+    assert "FINAL-LINE-BEFORE-EXIT" in failed["error"]
+    assert "日志已截断" in failed["error"]
+    # The retained detail is itself bounded to roughly one tail plus framing.
+    assert len(failed["error"]) < 4096 + 200

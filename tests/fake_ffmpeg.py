@@ -19,7 +19,15 @@ import time
 from pathlib import Path
 
 CONFIG_PATH = Path(__file__).with_name("fake_config.json")
-DEFAULT = {"sleep": 0.05, "exit": 0, "ignore_term": 0.0, "artifact": True}
+DEFAULT = {
+    "sleep": 0.05,
+    "exit": 0,
+    "ignore_term": 0.0,
+    "artifact": True,
+    "stderr_bytes": 0,
+    "stderr_chunk": 8192,
+    "stderr_before_sleep": False,
+}
 
 
 def load_config() -> dict:
@@ -86,6 +94,25 @@ def main(argv: list[str]) -> int:
     deadline = start + float(behaviour["sleep"])
     ignore_term = float(behaviour["ignore_term"])
 
+    # Emit far more than one pipe capacity (typically 64 KiB) so any code
+    # path that fails to drain stderr would deadlock this process.
+    stderr_bytes = int(behaviour.get("stderr_bytes", 0))
+    if stderr_bytes > 0:
+        chunk = b"fake-ffmpeg-noise-line-0123456789abcdef\n" * (
+            max(1, int(behaviour.get("stderr_chunk", 8192)) // 36)
+        )
+        remaining = stderr_bytes
+        while remaining > 0:
+            part = chunk if remaining >= len(chunk) else chunk[:remaining]
+            try:
+                sys.stderr.buffer.write(part)
+                sys.stderr.buffer.flush()
+            except BrokenPipeError:
+                break
+            remaining -= len(part)
+            if behaviour.get("stderr_before_sleep", False):
+                time.sleep(0.002)
+
     while True:
         now = time.monotonic()
         if terminated_at:
@@ -103,7 +130,11 @@ def main(argv: list[str]) -> int:
     exit_code = int(behaviour["exit"])
     if exit_code != 0 or not behaviour["artifact"]:
         output.unlink(missing_ok=True)
-        sys.stderr.write(f"fake-ffmpeg: simulated failure for {output.name}\n")
+        # This marker is written last, so a correct tail must contain it.
+        sys.stderr.write(
+            f"fake-ffmpeg: simulated failure for {output.name}\n"
+            "fake-ffmpeg: FINAL-LINE-BEFORE-EXIT\n"
+        )
         sys.stderr.flush()
         return exit_code or 1
 

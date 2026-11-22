@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 from pathlib import Path
 
 
@@ -30,6 +31,10 @@ BASE_DIR = Path(__file__).resolve().parent
 
 
 def _resolve_ffmpeg() -> str:
+    # May be a plain path ("ffmpeg") or a command prefix used by the noisy
+    # failure demo ("python3 /app/app/demo_noisy_ffmpeg.py"). Every call site
+    # splits it with shlex before building the subprocess argv, so both shapes
+    # work with list-form Popen/run (no shell interpretation).
     explicit = os.environ.get("FFMPEG_BINARY", "").strip()
     if explicit:
         return explicit
@@ -39,6 +44,12 @@ def _resolve_ffmpeg() -> str:
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         return "ffmpeg"
+
+
+def ffmpeg_argv(binary: str) -> list[str]:
+    """Split a configured ffmpeg command/prefix into argv tokens."""
+
+    return shlex.split(binary)
 
 
 class Settings:
@@ -61,6 +72,16 @@ class Settings:
         # Composition can start while cancelled ffmpeg processes are still
         # exiting; this is how long cleanup may take before we give up waiting.
         self.shutdown_grace_seconds = max(0.0, _env_float("SHUTDOWN_GRACE_SECONDS", 8.0))
+        # Only the tail of each attempt's ffmpeg stderr is retained, in a
+        # fixed-size in-memory ring buffer, so collection memory never grows
+        # with the amount a misbehaving ffmpeg logs.
+        self.stderr_tail_bytes = max(256, _env_int("STDERR_TAIL_BYTES", 4096))
+        # Upper bound on waiting for the stderr drain thread after a process
+        # has exited (failure path only). The pipe normally reaches EOF in
+        # microseconds; this only guards against an unresponsive thread.
+        self.stderr_drain_timeout_seconds = max(
+            0.05, _env_float("STDERR_DRAIN_TIMEOUT_SECONDS", 5.0)
+        )
         self.clip_names = ("A", "B", "C")
 
     @property

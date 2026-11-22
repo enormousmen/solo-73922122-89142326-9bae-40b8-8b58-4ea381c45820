@@ -143,7 +143,19 @@ button:disabled { opacity: .55; cursor: wait; }
 .attempt.selected { border-color: rgba(61, 204, 140, .55); }
 .attempt-kind { color: var(--muted); font-size: .72rem; }
 .attempt-time { color: var(--muted); font-variant-numeric: tabular-nums; }
-.attempt-error { grid-column: 1 / -1; color: var(--bad); font-size: .72rem; overflow-wrap: anywhere; }
+.attempt-error {
+  grid-column: 1 / -1;
+  color: var(--bad);
+  font-size: .72rem;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  max-height: 12em;
+  overflow: auto;
+  background: rgba(255, 107, 107, .08);
+  border: 1px solid rgba(255, 107, 107, .25);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
 
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; }
 .s-queued { background: var(--muted); }

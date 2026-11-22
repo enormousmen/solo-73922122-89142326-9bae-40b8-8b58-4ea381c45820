@@ -9,6 +9,44 @@ services:
       TRANSCODE_SLOTS: "2"
       SLOW_AFTER_SECONDS: "2.0"
       SLOW_READRATE: "0.4"
+      # Each attempt retains only the last STDERR_TAIL_BYTES of ffmpeg stderr.
+      STDERR_TAIL_BYTES: "4096"
+    volumes:
+      - preview-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # Demo of the bounded-stderr failure path:
+  #
+  #   docker compose --profile noisy-failure up --build
+  #
+  # Then open http://localhost:8000, start any batch, and watch segment B's
+  # attempt: its ffmpeg writes ~2 MiB of stderr (far beyond the OS pipe
+  # capacity) and exits 1. The UI stays responsive, other batches keep
+  # dispatching, and the failed attempt shows only the final 4 KiB log tail
+  # with an explicit truncation note. Fixture generation, probing, concat and
+  # the other two segments still run through the real ffmpeg.
+  noisy-preview:
+    profiles: ["noisy-failure"]
+    build: .
+    image: preview-batch-demo:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      TRANSCODE_SLOTS: "2"
+      SLOW_AFTER_SECONDS: "2.0"
+      SLOW_READRATE: "0.4"
+      STDERR_TAIL_BYTES: "4096"
+      REAL_FFMPEG_BINARY: "ffmpeg"
+      FFMPEG_BINARY: "python3 /app/app/demo_noisy_ffmpeg.py"
+      NOISY_FAIL_CLIP: "B"
+      NOISY_FAIL_BYTES: "2097152"
     volumes:
       - preview-data:/data
     healthcheck:

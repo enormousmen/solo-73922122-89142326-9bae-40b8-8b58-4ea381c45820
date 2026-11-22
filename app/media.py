@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Iterable
 
-from .config import Settings
+from .config import Settings, ffmpeg_argv
 
 # Every attempt — normal or slow — must land on this exact specification so the
 # final concat stream copy has no mid-stream reconfiguration.
@@ -41,7 +41,7 @@ class MediaError(RuntimeError):
 def _run(binary: str, args: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
-            [binary, "-hide_banner", "-loglevel", "error", *args],
+            [*ffmpeg_argv(binary), "-hide_banner", "-loglevel", "error", *args],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -117,7 +117,7 @@ def transcode_command(
     """
 
     args = [
-        settings.ffmpeg_binary,
+        *ffmpeg_argv(settings.ffmpeg_binary),
         "-hide_banner",
         "-loglevel",
         "error",
@@ -187,7 +187,7 @@ def _probe(ffmpeg_binary: str, path: Path) -> tuple[float, str] | None:
         return None
     try:
         result = subprocess.run(
-            [ffmpeg_binary, "-hide_banner", "-i", str(path), "-f", "null", "-"],
+            [*ffmpeg_argv(ffmpeg_binary), "-hide_banner", "-i", str(path), "-f", "null", "-"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
